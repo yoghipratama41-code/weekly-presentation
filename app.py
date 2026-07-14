@@ -10,17 +10,18 @@ st.set_page_config(page_title="GNS Weekly Report Auto", page_icon="📈", layout
 # ID Template Presentasi Weekly Report
 TEMPLATE_PRESENTATION_ID = "1paRGPc-qda5c0Ugrg6yI7U3xUVcga7lF4wCFQKCJqw0" 
 
-# Kredensial dari Streamlit Secrets
+# Kredensial dari Streamlit Secrets — SAMA seperti yang dipakai di app Endweek
 GOOGLE_CLIENT_ID = st.secrets["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = st.secrets["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REFRESH_TOKEN = st.secrets["GOOGLE_REFRESH_TOKEN"]
 
-# Scope mencakup spreadhseets.readonly agar bisa me-refresh grafik/tabel yang tertaut dari Sheets
+# Scope disamakan persis dengan app Endweek (drive.file, drive.readonly, presentations).
+# drive.readonly sudah cukup untuk refreshSheetsChart, jadi spreadsheets.readonly TIDAK perlu
+# ditambahkan — itu yang kemarin bikin invalid_scope karena refresh token lama belum punya izin itu.
 SCOPES = (
     "https://www.googleapis.com/auth/drive.file "
     "https://www.googleapis.com/auth/drive.readonly "
-    "https://www.googleapis.com/auth/presentations "
-    "https://www.googleapis.com/auth/spreadsheets.readonly" 
+    "https://www.googleapis.com/auth/presentations"
 )
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
@@ -28,7 +29,9 @@ TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 # ============== AUTHENTICATION ==============
 @st.cache_resource(ttl=1800)
 def get_creds():
-    """Mengambil kredensial menggunakan Refresh Token tanpa perlu login interaktif berulang."""
+    """Mengambil kredensial menggunakan Refresh Token tanpa perlu login interaktif berulang.
+    Pakai secrets.toml yang SAMA dengan app Endweek — scope-nya identik jadi tidak perlu
+    generate refresh token baru."""
     creds = Credentials(
         token=None,
         refresh_token=GOOGLE_REFRESH_TOKEN,
