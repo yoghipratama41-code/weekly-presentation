@@ -77,6 +77,57 @@ def _find_placeholder_shapes(presentation, placeholders):
     return found
 
 
+def _get_image_dimensions(uploaded_file):
+    """Ambil ukuran asli gambar (width, height dalam pixel) pakai Pillow."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(uploaded_file.getvalue()))
+    return img.size  # (width, height)
+
+
+def _fit_size_and_transform(shape_info, img_width_px, img_height_px):
+    """Hitung ukuran & posisi baru supaya gambar 'contain' (fit, tanpa distorsi) di dalam
+    kotak placeholder, bukan 'stretch' (dipaksa pas ukuran box sehingga rasio gambar berubah).
+    Gambar akan di-center di dalam box placeholder."""
+    box_size = shape_info["size"]
+    box_transform = shape_info["transform"]
+
+    box_w = box_size["width"]["magnitude"] * box_transform.get("scaleX", 1)
+    box_h = box_size["height"]["magnitude"] * box_transform.get("scaleY", 1)
+
+    img_ratio = img_width_px / img_height_px
+    box_ratio = box_w / box_h
+
+    if img_ratio > box_ratio:
+        # Gambar lebih "lebar" dari box -> lebar mengikuti box, tinggi menyesuaikan
+        new_w = box_w
+        new_h = box_w / img_ratio
+    else:
+        # Gambar lebih "tinggi" dari box -> tinggi mengikuti box, lebar menyesuaikan
+        new_h = box_h
+        new_w = box_h * img_ratio
+
+    box_left = box_transform.get("translateX", 0)
+    box_top = box_transform.get("translateY", 0)
+    new_left = box_left + (box_w - new_w) / 2
+    new_top = box_top + (box_h - new_h) / 2
+
+    unit = box_size["width"].get("unit", "EMU")
+    transform_unit = box_transform.get("unit", "EMU")
+
+    new_size = {
+        "width": {"magnitude": new_w, "unit": unit},
+        "height": {"magnitude": new_h, "unit": unit},
+    }
+    new_transform = {
+        "scaleX": 1,
+        "scaleY": 1,
+        "translateX": new_left,
+        "translateY": new_top,
+        "unit": transform_unit,
+    }
+    return new_size, new_transform
+
+
 def _upload_image_to_drive(drive_service, uploaded_file):
     """Upload file gambar (dari st.file_uploader) ke Drive punya app ini (scope drive.file cukup),
     lalu di-set 'anyone with link: reader' supaya bisa diakses server Slides API buat createImage.
@@ -117,6 +168,10 @@ def replace_placeholders_with_images(drive_service, slides_service, presentation
         if placeholder not in shape_map:
             continue
         shape_info = shape_map[placeholder]
+
+        img_w_px, img_h_px = _get_image_dimensions(uploaded_file)
+        fitted_size, fitted_transform = _fit_size_and_transform(shape_info, img_w_px, img_h_px)
+
         image_url = _upload_image_to_drive(drive_service, uploaded_file)
 
         requests.append({
@@ -124,8 +179,8 @@ def replace_placeholders_with_images(drive_service, slides_service, presentation
                 "url": image_url,
                 "elementProperties": {
                     "pageObjectId": shape_info["page_object_id"],
-                    "size": shape_info["size"],
-                    "transform": shape_info["transform"],
+                    "size": fitted_size,
+                    "transform": fitted_transform,
                 },
             }
         })
@@ -296,15 +351,15 @@ with st.form("form_report"):
     st.caption("Tanggal di bawah ini dipakai bareng untuk slide Malaysia dan Singapore ({DatA}-{DatE}).")
     dcol1, dcol2, dcol3, dcol4, dcol5 = st.columns(5)
     with dcol1:
-        input_dat_a = st.text_input("DatA", value="Tuesday")
+        input_dat_a = st.date_input("DatA", key="dat_a")
     with dcol2:
-        input_dat_b = st.text_input("DatB", value="Wednesday")
+        input_dat_b = st.date_input("DatB", key="dat_b")
     with dcol3:
-        input_dat_c = st.text_input("DatC", value="Thursday")
+        input_dat_c = st.date_input("DatC", key="dat_c")
     with dcol4:
-        input_dat_d = st.text_input("DatD", value="Friday")
+        input_dat_d = st.date_input("DatD", key="dat_d")
     with dcol5:
-        input_dat_e = st.text_input("DatE", value="Monday")
+        input_dat_e = st.date_input("DatE", key="dat_e")
 
     st.markdown("**🇲🇾 Broadcast Summary - Malaysia (slide terpisah)**")
     st.caption("Upload screenshot untuk tiap slot. Kosongkan kalau slot itu tidak dipakai minggu ini.")
@@ -349,11 +404,11 @@ if submitted:
 
     # Tanggal Broadcast Summary (dipakai bareng untuk slide M dan S)
     broadcast_dates = {
-        "DatA": input_dat_a,
-        "DatB": input_dat_b,
-        "DatC": input_dat_c,
-        "DatD": input_dat_d,
-        "DatE": input_dat_e,
+        "DatA": input_dat_a.strftime("%d/%m/%Y"),
+        "DatB": input_dat_b.strftime("%d/%m/%Y"),
+        "DatC": input_dat_c.strftime("%d/%m/%Y"),
+        "DatD": input_dat_d.strftime("%d/%m/%Y"),
+        "DatE": input_dat_e.strftime("%d/%m/%Y"),
     }
 
     # Metrik Payslips/Rider & Valid from Total (S=Grab Singapore, M=Grab Malaysia, G=Grab Timestamp Malaysia)
