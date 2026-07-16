@@ -27,6 +27,13 @@ SCOPES = (
 )
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
+# Rate konversi RM -> SGD (fixed, sesuai referensi yang dikasih user)
+RM_TO_SGD_RATE = 0.2850  # 1 RM = 0.2850 SGD (adjust as needed)
+
+# Warna zona Weekly Spending (dipakai untuk background cell Remark & warna teks Surplus/Deficit)
+SAFE_ZONE_COLOR = {"red": 0.0, "green": 0.0, "blue": 1.0}    # biru, sesuai "Safe Zone"
+DANGER_ZONE_COLOR = {"red": 1.0, "green": 0.0, "blue": 0.0}  # merah, sesuai "Danger Zone"
+
 
 # ============== AUTHENTICATION ==============
 @st.cache_resource(ttl=1800)
@@ -75,6 +82,88 @@ def _find_placeholder_shapes(presentation, placeholders):
                     "transform": el.get("transform"),
                 }
     return found
+
+
+# ============== HELPER: WEEKLY SPENDING TABLE (RM/SGD, warna zona) ==============
+def _get_table_cell_text(table_cell):
+    """Gabungin semua textRun di dalam satu cell tabel jadi satu string (strip whitespace)."""
+    text_elements = table_cell.get("text", {}).get("textElements", [])
+    full_text = "".join(
+        te.get("textRun", {}).get("content", "") for te in text_elements
+    )
+    return full_text.strip()
+
+
+def _find_table_cells(presentation, placeholders):
+    """Cari cell tabel yang isinya persis salah satu placeholder (misal '{SurplusM}').
+    HARUS dipanggil SEBELUM replaceAllText mengganti teksnya, karena pencarian berdasarkan
+    teks placeholder yang masih asli. Return dict: placeholder -> {table_object_id, row_index, column_index}"""
+    found = {}
+    for slide in presentation.get("slides", []):
+        for el in slide.get("pageElements", []):
+            table = el.get("table")
+            if not table:
+                continue
+            table_object_id = el.get("objectId")
+            for r, row in enumerate(table.get("tableRows", [])):
+                for c, cell in enumerate(row.get("tableCells", [])):
+                    text = _get_table_cell_text(cell)
+                    if text in placeholders:
+                        found[text] = {
+                            "table_object_id": table_object_id,
+                            "row_index": r,
+                            "column_index": c,
+                        }
+    return found
+
+
+def _build_spending_color_requests(cell_map, region_prefix, is_safe):
+    """Bangun request buat ganti warna teks Surplus/Deficit & background cell Remark,
+    sesuai zona (Safe = biru, Danger = merah)."""
+    color = SAFE_ZONE_COLOR if is_safe else DANGER_ZONE_COLOR
+    surplus_key = "{Surplus" + region_prefix + "}"
+    remark_key = "{Remark" + region_prefix + "}"
+    requests = []
+
+    if surplus_key in cell_map:
+        c = cell_map[surplus_key]
+        requests.append({
+            "updateTextStyle": {
+                "objectId": c["table_object_id"],
+                "cellLocation": {"rowIndex": c["row_index"], "columnIndex": c["column_index"]},
+                "style": {"foregroundColor": {"opaqueColor": {"rgbColor": color}}},
+                "textRange": {"type": "ALL"},
+                "fields": "foregroundColor",
+            }
+        })
+
+    if remark_key in cell_map:
+        c = cell_map[remark_key]
+        requests.append({
+            "updateTableCellProperties": {
+                "objectId": c["table_object_id"],
+                "tableRange": {
+                    "location": {"rowIndex": c["row_index"], "columnIndex": c["column_index"]},
+                    "rowSpan": 1,
+                    "columnSpan": 1,
+                },
+                "tableCellProperties": {
+                    "tableCellBackgroundFill": {"solidFill": {"color": {"rgbColor": color}}}
+                },
+                "fields": "tableCellBackgroundFill.solidFill.color",
+            }
+        })
+
+    return requests
+
+
+def _format_amount(value):
+    """Format angka: kalau bulat tampil tanpa desimal (624), kalau nggak tampil dengan
+    desimal secukupnya tanpa trailing zero (307.51, 279.2)."""
+    if abs(value - round(value)) < 0.005:
+        return f"{value:.0f}"
+    s = f"{value:.2f}".rstrip("0").rstrip(".")
+    return s
 
 
 def _get_image_dimensions(uploaded_file):
@@ -195,7 +284,7 @@ def replace_placeholders_with_images(drive_service, slides_service, presentation
 
 # ============== CORE AUTOMATION LOGIC ==============
 def generate_weekly_report(creds, current_week, last_week, date_range, shopee_data,
-                            broadcast_dates, broadcast_images, grab_metrics, status_box):
+                            broadcast_dates, broadcast_images, grab_metrics, spending_data, status_box):
     drive_service = build("drive", "v3", credentials=creds)
     slides_service = build("slides", "v1", credentials=creds)
 
@@ -207,6 +296,42 @@ def generate_weekly_report(creds, current_week, last_week, date_range, shopee_da
     ).execute()
     id_slide_baru = copy.get("id")
     link_presentasi = f"https://docs.google.com/presentation/d/{id_slide_baru}/edit"
+
+    # 1b. Cari lokasi cell tabel Weekly Spending SEBELUM teksnya diganti
+    #     (harus sebelum replaceAllText, karena pencarian berdasarkan teks placeholder asli)
+    spending_placeholders = {
+        "{BudgetCapM}", "{SpentM}", "{SurplusM}", "{RemarkM}",
+        "{BudgetCapS}", "{SpentS}", "{SurplusS}", "{RemarkS}",
+    }
+    presentation_awal = slides_service.presentations().get(presentationId=id_slide_baru).execute()
+    spending_cell_map = _find_table_cells(presentation_awal, spending_placeholders)
+
+    # 1c. Hitung Weekly Spending (Malaysia: RM -> SGD, Singapore: langsung SGD)
+    spending_data = spending_data or {}
+    m_data = spending_data.get("M", {})
+    s_data = spending_data.get("S", {})
+
+    m_budget_cap = float(m_data.get("budget_cap") or 0)
+    m_rm_spent = float(m_data.get("rm_spent") or 0)
+    m_sgd_spent = m_rm_spent * RM_TO_SGD_RATE
+    m_surplus = m_budget_cap - m_sgd_spent
+    m_is_safe = m_surplus >= 0
+
+    s_budget_cap = float(s_data.get("budget_cap") or 0)
+    s_sgd_spent = float(s_data.get("sgd_spent") or 0)
+    s_surplus = s_budget_cap - s_sgd_spent
+    s_is_safe = s_surplus >= 0
+
+    spending_text_values = {
+        "{BudgetCapM}": f"S${_format_amount(m_budget_cap)}",
+        "{SpentM}": f"S${_format_amount(m_sgd_spent)} (RM {_format_amount(m_rm_spent)})",
+        "{SurplusM}": f"{'+' if m_is_safe else '-'}S${_format_amount(abs(m_surplus))}",
+        "{RemarkM}": "Safe Zone" if m_is_safe else "Danger Zone",
+        "{BudgetCapS}": f"S${_format_amount(s_budget_cap)}",
+        "{SpentS}": f"S${_format_amount(s_sgd_spent)}",
+        "{SurplusS}": f"{'+' if s_is_safe else '-'}S${_format_amount(abs(s_surplus))}",
+        "{RemarkS}": "Safe Zone" if s_is_safe else "Danger Zone",
+    }
 
     # 2. Hitung Persentase Shopee Accepted
     try:
@@ -250,11 +375,32 @@ def generate_weekly_report(creds, current_week, last_week, date_range, shopee_da
         {"replaceAllText": {"containsText": {"text": "{ValidM}", "matchCase": True}, "replaceText": grab_metrics["ValidM"]}},
         {"replaceAllText": {"containsText": {"text": "{PayslipsG}", "matchCase": True}, "replaceText": grab_metrics["PayslipsG"]}},
         {"replaceAllText": {"containsText": {"text": "{ValidG}", "matchCase": True}, "replaceText": grab_metrics["ValidG"]}},
+
+        # Penggantian Weekly Spending (Malaysia & Singapore)
+        {"replaceAllText": {"containsText": {"text": "{BudgetCapM}", "matchCase": True}, "replaceText": spending_text_values["{BudgetCapM}"]}},
+        {"replaceAllText": {"containsText": {"text": "{SpentM}", "matchCase": True}, "replaceText": spending_text_values["{SpentM}"]}},
+        {"replaceAllText": {"containsText": {"text": "{SurplusM}", "matchCase": True}, "replaceText": spending_text_values["{SurplusM}"]}},
+        {"replaceAllText": {"containsText": {"text": "{RemarkM}", "matchCase": True}, "replaceText": spending_text_values["{RemarkM}"]}},
+        {"replaceAllText": {"containsText": {"text": "{BudgetCapS}", "matchCase": True}, "replaceText": spending_text_values["{BudgetCapS}"]}},
+        {"replaceAllText": {"containsText": {"text": "{SpentS}", "matchCase": True}, "replaceText": spending_text_values["{SpentS}"]}},
+        {"replaceAllText": {"containsText": {"text": "{SurplusS}", "matchCase": True}, "replaceText": spending_text_values["{SurplusS}"]}},
+        {"replaceAllText": {"containsText": {"text": "{RemarkS}", "matchCase": True}, "replaceText": spending_text_values["{RemarkS}"]}},
     ]
-    
+
     slides_service.presentations().batchUpdate(
         presentationId=id_slide_baru, body={"requests": replace_requests}
     ).execute()
+
+    # 3b. Ganti Warna Zona Weekly Spending (background Remark & warna teks Surplus/Deficit)
+    status_box.info("🎨 Menyesuaikan warna zona Weekly Spending (Safe/Danger)...")
+    color_requests = (
+        _build_spending_color_requests(spending_cell_map, "M", m_is_safe)
+        + _build_spending_color_requests(spending_cell_map, "S", s_is_safe)
+    )
+    if color_requests:
+        slides_service.presentations().batchUpdate(
+            presentationId=id_slide_baru, body={"requests": color_requests}
+        ).execute()
 
     # 4. Refresh Chart & Tabel Tertaut
     status_box.info("🔄 Memindai dan memperbarui visualisasi (grafik & tabel) dari Google Sheets...")
@@ -347,6 +493,20 @@ with st.form("form_report"):
 
     st.divider()
 
+    st.subheader("💰 Weekly Spending")
+    st.caption(f"Malaysia: input Ringgit yang di-spend, otomatis dikonversi ke SGD (rate: 1 RM = {RM_TO_SGD_RATE} SGD). Singapore: input SGD langsung.")
+    wcol_m, wcol_s = st.columns(2)
+    with wcol_m:
+        st.markdown("**🇲🇾 Malaysia**")
+        input_budget_cap_m = st.text_input("Weekly Budget Cap (SGD)", value="307.51", key="budget_cap_m")
+        input_rm_spent_m = st.text_input("Amount Spent (RM)", value="879.5", key="rm_spent_m")
+    with wcol_s:
+        st.markdown("**🇸🇬 Singapore**")
+        input_budget_cap_s = st.text_input("Weekly Budget Cap (SGD)", value="624", key="budget_cap_s")
+        input_sgd_spent_s = st.text_input("Amount Spent (SGD)", value="646", key="sgd_spent_s")
+
+    st.divider()
+
     st.subheader("📢 Broadcast Summary")
     st.caption("Tanggal di bawah ini dipakai bareng untuk slide Malaysia dan Singapore ({DatA}-{DatE}).")
     dcol1, dcol2, dcol3, dcol4, dcol5 = st.columns(5)
@@ -435,6 +595,12 @@ if submitted:
         "{BroadS5}": img_broad_s5,
     }
     
+    # Weekly Spending (Malaysia: RM -> SGD, Singapore: langsung SGD)
+    spending_data = {
+        "M": {"budget_cap": input_budget_cap_m, "rm_spent": input_rm_spent_m},
+        "S": {"budget_cap": input_budget_cap_s, "sgd_spent": input_sgd_spent_s},
+    }
+
     with st.spinner("Memproses laporan mingguan..."):
         try:
             hasil_link = generate_weekly_report(
@@ -446,6 +612,7 @@ if submitted:
                 broadcast_dates,
                 broadcast_images,
                 grab_metrics,
+                spending_data,
                 status_box
             )
             st.balloons()
