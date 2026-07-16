@@ -564,11 +564,11 @@ if submitted:
 
     # Tanggal Broadcast Summary (dipakai bareng untuk slide M dan S)
     broadcast_dates = {
-        "DatA": input_dat_a.strftime("%d/%m/%Y"),
-        "DatB": input_dat_b.strftime("%d/%m/%Y"),
-        "DatC": input_dat_c.strftime("%d/%m/%Y"),
-        "DatD": input_dat_d.strftime("%d/%m/%Y"),
-        "DatE": input_dat_e.strftime("%d/%m/%Y"),
+        "DatA": input_dat_a,
+        "DatB": input_dat_b,
+        "DatC": input_dat_c,
+        "DatD": input_dat_d,
+        "DatE": input_dat_e,
     }
 
     # Metrik Payslips/Rider & Valid from Total (S=Grab Singapore, M=Grab Malaysia, G=Grab Timestamp Malaysia)
