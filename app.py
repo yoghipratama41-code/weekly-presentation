@@ -1,6 +1,8 @@
+import io
 import time
 import streamlit as st
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
@@ -44,8 +46,101 @@ def get_creds():
     return creds
 
 
+# ============== HELPER: BROADCAST SUMMARY IMAGE PLACEMENT ==============
+def _get_shape_full_text(page_element):
+    """Gabungin semua textRun di dalam sebuah shape jadi satu string (strip whitespace)."""
+    shape = page_element.get("shape")
+    if not shape:
+        return ""
+    text_elements = shape.get("text", {}).get("textElements", [])
+    full_text = "".join(
+        te.get("textRun", {}).get("content", "") for te in text_elements
+    )
+    return full_text.strip()
+
+
+def _find_placeholder_shapes(presentation, placeholders):
+    """Cari shape yang isinya persis salah satu dari daftar placeholder (misal '{BroadM1}').
+    Return dict: placeholder -> {page_object_id, object_id, size, transform}"""
+    found = {}
+    for slide in presentation.get("slides", []):
+        page_object_id = slide.get("objectId")
+        for el in slide.get("pageElements", []):
+            text = _get_shape_full_text(el)
+            if text in placeholders:
+                found[text] = {
+                    "page_object_id": page_object_id,
+                    "object_id": el.get("objectId"),
+                    "size": el.get("size"),
+                    "transform": el.get("transform"),
+                }
+    return found
+
+
+def _upload_image_to_drive(drive_service, uploaded_file):
+    """Upload file gambar (dari st.file_uploader) ke Drive punya app ini (scope drive.file cukup),
+    lalu di-set 'anyone with link: reader' supaya bisa diakses server Slides API buat createImage.
+    Return URL gambar yang bisa dipakai di request createImage."""
+    media = MediaIoBaseUpload(
+        io.BytesIO(uploaded_file.getvalue()),
+        mimetype=uploaded_file.type or "image/png",
+        resumable=False,
+    )
+    file = drive_service.files().create(
+        body={"name": uploaded_file.name}, media_body=media, fields="id"
+    ).execute()
+    file_id = file.get("id")
+
+    drive_service.permissions().create(
+        fileId=file_id, body={"type": "anyone", "role": "reader"}
+    ).execute()
+
+    return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+
+def replace_placeholders_with_images(drive_service, slides_service, presentation_id, image_uploads, status_box):
+    """image_uploads: dict placeholder -> UploadedFile (misal '{BroadM1}': <file>).
+    Placeholder kosong (user belum upload) dilewati saja."""
+    image_uploads = {k: v for k, v in image_uploads.items() if v is not None}
+    if not image_uploads:
+        return
+
+    presentation = slides_service.presentations().get(presentationId=presentation_id).execute()
+    shape_map = _find_placeholder_shapes(presentation, set(image_uploads.keys()))
+
+    missing = [ph for ph in image_uploads if ph not in shape_map]
+    if missing:
+        status_box.warning(f"⚠️ Placeholder berikut tidak ditemukan di slide, dilewati: {', '.join(missing)}")
+
+    requests = []
+    for placeholder, uploaded_file in image_uploads.items():
+        if placeholder not in shape_map:
+            continue
+        shape_info = shape_map[placeholder]
+        image_url = _upload_image_to_drive(drive_service, uploaded_file)
+
+        requests.append({
+            "createImage": {
+                "url": image_url,
+                "elementProperties": {
+                    "pageObjectId": shape_info["page_object_id"],
+                    "size": shape_info["size"],
+                    "transform": shape_info["transform"],
+                },
+            }
+        })
+        requests.append({"deleteObject": {"objectId": shape_info["object_id"]}})
+
+    if requests:
+        slides_service.presentations().batchUpdate(
+            presentationId=presentation_id, body={"requests": requests}
+        ).execute()
+        status_box.success(f"🖼️ {len(image_uploads) - len(missing)} gambar Broadcast Summary berhasil ditempatkan!")
+
+
 # ============== CORE AUTOMATION LOGIC ==============
-def generate_weekly_report(creds, current_week, last_week, date_range, shopee_data, status_box):
+def generate_weekly_report(creds, current_week, last_week, date_range, shopee_data,
+                            broadcast_dates, broadcast_images, grab_metrics, status_box):
     drive_service = build("drive", "v3", credentials=creds)
     slides_service = build("slides", "v1", credentials=creds)
 
@@ -77,6 +172,13 @@ def generate_weekly_report(creds, current_week, last_week, date_range, shopee_da
         {"replaceAllText": {"containsText": {"text": "{{CURRENT_WEEK}}", "matchCase": True}, "replaceText": current_week}},
         {"replaceAllText": {"containsText": {"text": "{{LAST_WEEK}}", "matchCase": True}, "replaceText": last_week}},
         {"replaceAllText": {"containsText": {"text": "{{DATE_RANGE}}", "matchCase": True}, "replaceText": date_range}},
+
+        # Penggantian Tanggal Broadcast Summary (dipakai bareng untuk slide M dan slide S)
+        {"replaceAllText": {"containsText": {"text": "{DatA}", "matchCase": True}, "replaceText": broadcast_dates["DatA"]}},
+        {"replaceAllText": {"containsText": {"text": "{DatB}", "matchCase": True}, "replaceText": broadcast_dates["DatB"]}},
+        {"replaceAllText": {"containsText": {"text": "{DatC}", "matchCase": True}, "replaceText": broadcast_dates["DatC"]}},
+        {"replaceAllText": {"containsText": {"text": "{DatD}", "matchCase": True}, "replaceText": broadcast_dates["DatD"]}},
+        {"replaceAllText": {"containsText": {"text": "{DatE}", "matchCase": True}, "replaceText": broadcast_dates["DatE"]}},
         
         # Penggantian Data Shopee (Slide 15)
         {"replaceAllText": {"containsText": {"text": "{{SHOPEE_PAYSLIPS}}", "matchCase": True}, "replaceText": shopee_data["payslips"]}},
@@ -84,6 +186,15 @@ def generate_weekly_report(creds, current_week, last_week, date_range, shopee_da
         {"replaceAllText": {"containsText": {"text": "{{SHOPEE_ACCEPTED}}", "matchCase": True}, "replaceText": shopee_data["accepted"]}},
         {"replaceAllText": {"containsText": {"text": "{{SHOPEE_PERCENTAGE}}", "matchCase": True}, "replaceText": shopee_percentage_str}},
         {"replaceAllText": {"containsText": {"text": "{{SHOPEE_NOTES}}", "matchCase": True}, "replaceText": shopee_data["notes"]}},
+
+        # Penggantian Metrik Payslips/Rider & Valid from Total
+        # S = Grab Singapore, M = Grab Malaysia, G = Grab Timestamp Malaysia
+        {"replaceAllText": {"containsText": {"text": "{PayslipsS}", "matchCase": True}, "replaceText": grab_metrics["PayslipsS"]}},
+        {"replaceAllText": {"containsText": {"text": "{ValidS}", "matchCase": True}, "replaceText": grab_metrics["ValidS"]}},
+        {"replaceAllText": {"containsText": {"text": "{PayslipsM}", "matchCase": True}, "replaceText": grab_metrics["PayslipsM"]}},
+        {"replaceAllText": {"containsText": {"text": "{ValidM}", "matchCase": True}, "replaceText": grab_metrics["ValidM"]}},
+        {"replaceAllText": {"containsText": {"text": "{PayslipsG}", "matchCase": True}, "replaceText": grab_metrics["PayslipsG"]}},
+        {"replaceAllText": {"containsText": {"text": "{ValidG}", "matchCase": True}, "replaceText": grab_metrics["ValidG"]}},
     ]
     
     slides_service.presentations().batchUpdate(
@@ -112,6 +223,10 @@ def generate_weekly_report(creds, current_week, last_week, date_range, shopee_da
         status_box.success(f"✅ {len(refresh_requests)} grafik/tabel berhasil diperbarui dengan data terkini!")
     else:
         status_box.warning("ℹ️ Tidak ada grafik/tabel tertaut yang ditemukan untuk di-refresh.")
+
+    # 5. Tempatkan Gambar Broadcast Summary (Malaysia & Singapore, dua slide terpisah)
+    status_box.info("🖼️ Menempatkan gambar Broadcast Summary (Malaysia & Singapore)...")
+    replace_placeholders_with_images(drive_service, slides_service, id_slide_baru, broadcast_images, status_box)
 
     return link_presentasi
 
@@ -156,7 +271,68 @@ with st.form("form_report"):
     
     st.info("💡 Persentase (Accepted Percentage) akan dihitung otomatis oleh sistem.")
     st.caption("Pastikan template Google Slides Anda sudah memuat placeholder: {{CURRENT_WEEK}}, {{LAST_WEEK}}, {{DATE_RANGE}}, {{SHOPEE_PAYSLIPS}}, {{SHOPEE_RIDERS}}, {{SHOPEE_ACCEPTED}}, {{SHOPEE_PERCENTAGE}}, dan {{SHOPEE_NOTES}}.")
-    
+
+    st.divider()
+
+    st.subheader("📊 Payslips/Rider & Valid from Total")
+    st.caption("S = Grab Singapore, M = Grab Malaysia, G = Grab Timestamp Malaysia")
+    gcol_s, gcol_m, gcol_g = st.columns(3)
+    with gcol_s:
+        st.markdown("**Grab Singapore (S)**")
+        input_payslips_s = st.text_input("Payslips/Rider", value="20.85", key="payslips_s")
+        input_valid_s = st.text_input("Valid from Total", value="90.8%", key="valid_s")
+    with gcol_m:
+        st.markdown("**Grab Malaysia (M)**")
+        input_payslips_m = st.text_input("Payslips/Rider", value="20.85", key="payslips_m")
+        input_valid_m = st.text_input("Valid from Total", value="90.8%", key="valid_m")
+    with gcol_g:
+        st.markdown("**Grab Timestamp Malaysia (G)**")
+        input_payslips_g = st.text_input("Payslips/Rider", value="20.85", key="payslips_g")
+        input_valid_g = st.text_input("Valid from Total", value="90.8%", key="valid_g")
+
+    st.divider()
+
+    st.subheader("📢 Broadcast Summary")
+    st.caption("Tanggal di bawah ini dipakai bareng untuk slide Malaysia dan Singapore ({DatA}-{DatE}).")
+    dcol1, dcol2, dcol3, dcol4, dcol5 = st.columns(5)
+    with dcol1:
+        input_dat_a = st.text_input("DatA", value="Tuesday")
+    with dcol2:
+        input_dat_b = st.text_input("DatB", value="Wednesday")
+    with dcol3:
+        input_dat_c = st.text_input("DatC", value="Thursday")
+    with dcol4:
+        input_dat_d = st.text_input("DatD", value="Friday")
+    with dcol5:
+        input_dat_e = st.text_input("DatE", value="Monday")
+
+    st.markdown("**🇲🇾 Broadcast Summary - Malaysia (slide terpisah)**")
+    st.caption("Upload screenshot untuk tiap slot. Kosongkan kalau slot itu tidak dipakai minggu ini.")
+    mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
+    with mcol1:
+        img_broad_m1 = st.file_uploader("BroadM1", type=["png", "jpg", "jpeg"], key="broad_m1")
+    with mcol2:
+        img_broad_m2 = st.file_uploader("BroadM2", type=["png", "jpg", "jpeg"], key="broad_m2")
+    with mcol3:
+        img_broad_m3 = st.file_uploader("BroadM3", type=["png", "jpg", "jpeg"], key="broad_m3")
+    with mcol4:
+        img_broad_m4 = st.file_uploader("BroadM4", type=["png", "jpg", "jpeg"], key="broad_m4")
+    with mcol5:
+        img_broad_m5 = st.file_uploader("BroadM5", type=["png", "jpg", "jpeg"], key="broad_m5")
+
+    st.markdown("**🇸🇬 Broadcast Summary - Singapore (slide terpisah)**")
+    scol1, scol2, scol3, scol4, scol5 = st.columns(5)
+    with scol1:
+        img_broad_s1 = st.file_uploader("BroadS1", type=["png", "jpg", "jpeg"], key="broad_s1")
+    with scol2:
+        img_broad_s2 = st.file_uploader("BroadS2", type=["png", "jpg", "jpeg"], key="broad_s2")
+    with scol3:
+        img_broad_s3 = st.file_uploader("BroadS3", type=["png", "jpg", "jpeg"], key="broad_s3")
+    with scol4:
+        img_broad_s4 = st.file_uploader("BroadS4", type=["png", "jpg", "jpeg"], key="broad_s4")
+    with scol5:
+        img_broad_s5 = st.file_uploader("BroadS5", type=["png", "jpg", "jpeg"], key="broad_s5")
+
     submitted = st.form_submit_button("🚀 Generate Report", type="primary")
 
 # Eksekusi saat tombol ditekan
@@ -170,6 +346,39 @@ if submitted:
         "riders": input_shopee_riders,
         "notes": input_shopee_notes
     }
+
+    # Tanggal Broadcast Summary (dipakai bareng untuk slide M dan S)
+    broadcast_dates = {
+        "DatA": input_dat_a,
+        "DatB": input_dat_b,
+        "DatC": input_dat_c,
+        "DatD": input_dat_d,
+        "DatE": input_dat_e,
+    }
+
+    # Metrik Payslips/Rider & Valid from Total (S=Grab Singapore, M=Grab Malaysia, G=Grab Timestamp Malaysia)
+    grab_metrics = {
+        "PayslipsS": input_payslips_s,
+        "ValidS": input_valid_s,
+        "PayslipsM": input_payslips_m,
+        "ValidM": input_valid_m,
+        "PayslipsG": input_payslips_g,
+        "ValidG": input_valid_g,
+    }
+
+    # Gambar Broadcast Summary per slot placeholder (nilai None kalau belum diupload, akan dilewati)
+    broadcast_images = {
+        "{BroadM1}": img_broad_m1,
+        "{BroadM2}": img_broad_m2,
+        "{BroadM3}": img_broad_m3,
+        "{BroadM4}": img_broad_m4,
+        "{BroadM5}": img_broad_m5,
+        "{BroadS1}": img_broad_s1,
+        "{BroadS2}": img_broad_s2,
+        "{BroadS3}": img_broad_s3,
+        "{BroadS4}": img_broad_s4,
+        "{BroadS5}": img_broad_s5,
+    }
     
     with st.spinner("Memproses laporan mingguan..."):
         try:
@@ -179,6 +388,9 @@ if submitted:
                 input_last_week, 
                 input_date_range, 
                 shopee_data,
+                broadcast_dates,
+                broadcast_images,
+                grab_metrics,
                 status_box
             )
             st.balloons()
