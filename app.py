@@ -351,15 +351,15 @@ with st.form("form_report"):
     st.caption("Tanggal di bawah ini dipakai bareng untuk slide Malaysia dan Singapore ({DatA}-{DatE}).")
     dcol1, dcol2, dcol3, dcol4, dcol5 = st.columns(5)
     with dcol1:
-        input_dat_a = st.date_input("DatA", key="dat_a")
+        input_dat_a = st.text_input("DatA", value="13th July")
     with dcol2:
-        input_dat_b = st.date_input("DatB", key="dat_b")
+        input_dat_b = st.text_input("DatB", value="14th July")
     with dcol3:
-        input_dat_c = st.date_input("DatC", key="dat_c")
+        input_dat_c = st.text_input("DatC", value="15th July")
     with dcol4:
-        input_dat_d = st.date_input("DatD", key="dat_d")
+        input_dat_d = st.text_input("DatD", value="16th July")
     with dcol5:
-        input_dat_e = st.date_input("DatE", key="dat_e")
+        input_dat_e = st.text_input("DatE", value="17th July")
 
     st.markdown("**🇲🇾 Broadcast Summary - Malaysia (slide terpisah)**")
     st.caption("Upload screenshot untuk tiap slot. Kosongkan kalau slot itu tidak dipakai minggu ini.")
